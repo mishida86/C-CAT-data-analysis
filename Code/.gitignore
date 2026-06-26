@@ -1,0 +1,5 @@
+*.rds
+*.RData
+*.Rhistory
+output/
+data/
