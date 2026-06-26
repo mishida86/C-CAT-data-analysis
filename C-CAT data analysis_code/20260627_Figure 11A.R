@@ -1,8 +1,9 @@
 # ============================================================
-# Figure 11A. Opportunity decay after CGP
-# 20260626
-# Masaki Ishida
-# Risk table: aligned under X-axis ticks
+# Figure 11A. Opportunity decay after CGP — Overall KM only
+# X-axis: Months from CGP
+# Number at risk directly under x-axis ticks
+# No annotation on plot
+# Outputs 12, 24, 36, 48, 60-month rates to console and CSV
 # ============================================================
 
 suppressPackageStartupMessages({
@@ -10,7 +11,6 @@ suppressPackageStartupMessages({
   library(survival)
   library(ggplot2)
   library(cowplot)
-  library(grid)
   library(lubridate)
 })
 
@@ -22,16 +22,15 @@ dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 admin_censor_date <- as.Date("2025-12-31")
 font_family <- "Arial"
 
-landmark_days <- c(365)
-landmark_labels <- c("12-month")
-risk_months <- c(0, 12, 24, 36, 48)
-risk_days <- round(risk_months * 365.25 / 12)
-
 id_col <- "C-CAT調査結果-基本項目.ハッシュID"
 panel_col <- "C-CAT調査結果-基本項目.パネル名"
 cgp_date_col <- "C-CAT調査結果-基本項目.検体採取日"
 domestic_approved_n <- "C-CAT調査結果-サマリ.国内承認薬数"
 report_age_col <- "C-CAT調査結果-基本項目.年齢(年)"
+
+# ----------------------------
+# Helper functions
+# ----------------------------
 
 first_token <- function(x) {
   x <- as.character(x)
@@ -56,10 +55,6 @@ is_solid <- function(x) {
   )
 }
 
-fmt_rate_ci <- function(est, lo, hi) {
-  sprintf("%.1f%% (%.1f-%.1f)", 100 * est, 100 * lo, 100 * hi)
-}
-
 theme_nm <- function() {
   theme_classic(base_size = 11, base_family = font_family) +
     theme(
@@ -69,7 +64,7 @@ theme_nm <- function() {
       axis.title = element_text(face = "plain", colour = "black", size = 11),
       axis.text = element_text(colour = "black", size = 10),
       axis.line = element_line(colour = "black", linewidth = 0.5),
-      plot.margin = margin(5, 10, 5, 5)
+      plot.margin = margin(5, 35, 2, 70)
     )
 }
 
@@ -77,29 +72,29 @@ build_survival_fields <- function(dt) {
   dt[, death_dt := as.Date(parse_date(death_date))]
   dt[, fu_dt := as.Date(parse_date(last_fu))]
   dt[, matched_tx_dt := as.Date(parse_date(matched_tx_date))]
-
+  
   dt[, fu_end := fcase(
     outcome == "死亡" & !is.na(death_dt),
     pmin(death_dt, admin_censor_date, na.rm = TRUE),
-
+    
     !is.na(fu_dt),
     pmin(fu_dt, admin_censor_date, na.rm = TRUE),
-
+    
     default = as.Date(NA)
   )]
-
+  
   dt[, tx_after_cgp := fifelse(
     !is.na(matched_tx_dt) & matched_tx_dt >= cgp_date,
     matched_tx_dt,
     as.Date(NA)
   )]
-
+  
   dt[, death_after_cgp := fifelse(
     outcome == "死亡" & !is.na(death_dt) & death_dt >= cgp_date,
     death_dt,
     as.Date(NA)
   )]
-
+  
   dt[, stop_dt := pmin(
     fifelse(!is.na(tx_after_cgp), tx_after_cgp, as.Date("9999-12-31")),
     fifelse(!is.na(death_after_cgp), death_after_cgp, as.Date("9999-12-31")),
@@ -107,46 +102,47 @@ build_survival_fields <- function(dt) {
     admin_censor_date,
     na.rm = TRUE
   )]
-
+  
   dt[, opp_event := as.integer(
     !is.na(death_after_cgp) &
       (is.na(tx_after_cgp) | death_after_cgp < tx_after_cgp)
   )]
-
+  
   dt[, opp_time_days := as.numeric(stop_dt - cgp_date)]
   dt[opp_time_days < 0, opp_time_days := 0]
-
+  
   dt
 }
 
 apply_exclusions <- function(dt) {
   n0 <- nrow(dt)
-
+  
   dt[, flag_tx_before_cgp := !is.na(matched_tx_dt) & matched_tx_dt < cgp_date]
   dt[, flag_death_before_cgp := !is.na(death_dt) & death_dt < cgp_date]
-
+  
   n_tx <- dt[flag_tx_before_cgp == TRUE, .N]
   n_death <- dt[flag_death_before_cgp == TRUE, .N]
-
+  
   out <- dt[flag_tx_before_cgp == FALSE & flag_death_before_cgp == FALSE]
-
+  
   n_miss_cgp <- out[is.na(cgp_date), .N]
   n_miss_fu <- out[is.na(fu_end), .N]
-
+  
   out <- out[!is.na(cgp_date) & !is.na(fu_end)]
-
+  
   message("Starting N: ", n0)
   message("Excluded matched therapy before CGP: ", n_tx)
   message("Excluded death before CGP: ", n_death)
   message("Excluded missing CGP date: ", n_miss_cgp)
   message("Excluded missing follow-up: ", n_miss_fu)
   message("Analyzable N: ", nrow(out))
-
+  
   out
 }
 
 surv_step_df <- function(fit) {
   sm <- summary(fit)
+  
   data.table(
     time_days = sm$time,
     time_months = sm$time / 30.4375,
@@ -156,26 +152,23 @@ surv_step_df <- function(fit) {
   )
 }
 
-km_landmarks <- function(fit) {
-  ss <- summary(fit, times = landmark_days, extend = TRUE)
+plot_km_panel_a <- function(fit, x_max_months = 62) {
+  risk_months <- c(0, 12, 24, 36, 48, 60)
+  risk_days <- round(risk_months * 365.25 / 12)
+  plot_margin_lr <- c(left = 85, right = 35)
 
-  data.table(
-    landmark = landmark_labels,
-    time_days = landmark_days,
-    rate = ss$surv,
-    lower_95 = ss$lower,
-    upper_95 = ss$upper,
-    rate_ci = fmt_rate_ci(ss$surv, ss$lower, ss$upper)
-  )
-}
-
-plot_km_panel_a <- function(fit, annotation_txt = NULL, x_max_months = 48) {
   sdf <- surv_step_df(fit)
-
   sdf[, surv_pct := 100 * surv]
   sdf[, lower_pct := 100 * lower]
   sdf[, upper_pct := 100 * upper]
 
+  rs <- summary(fit, times = risk_days, extend = TRUE)
+  risk_tbl <- data.table(
+    months = risk_months,
+    n_risk = rs$n.risk
+  )
+
+  # Upper panel: KM + x-axis line + tick labels (origin at 0,0; no padding at 0)
   p_main <- ggplot(sdf, aes(x = time_months, y = surv_pct)) +
     geom_ribbon(
       aes(ymin = lower_pct, ymax = upper_pct),
@@ -187,61 +180,77 @@ plot_km_panel_a <- function(fit, annotation_txt = NULL, x_max_months = 48) {
     scale_x_continuous(
       limits = c(0, x_max_months),
       breaks = risk_months,
-      expand = c(0.01, 0)
+      labels = risk_months,
+      expand = c(0, 0)
     ) +
     scale_y_continuous(
       limits = c(0, 100),
       breaks = seq(0, 100, 20),
-      expand = c(0.01, 0)
+      expand = expansion(mult = c(0, 0.02), add = c(0, 0))
     ) +
-    labs(
-      x = "Months from CGP",
-      y = "Remaining genomic opportunity (%)"
+    coord_cartesian(expand = FALSE, clip = "off") +
+    labs(y = "Remaining genomic opportunity (%)") +
+    theme_nm() +
+    theme(
+      axis.title.x = element_blank(),
+      plot.margin = margin(5, plot_margin_lr["right"], 14, plot_margin_lr["left"])
+    )
+
+  # Lower panel: risk counts under tick labels; "Number at risk" label below counts
+  p_risk <- ggplot(risk_tbl, aes(x = months)) +
+    geom_text(
+      aes(y = 0.58, label = format(n_risk, big.mark = ",")),
+      size = 3.1,
+      family = font_family,
+      vjust = 1
     ) +
-    theme_nm()
-
-  if (!is.null(annotation_txt)) {
-    p_main <- p_main +
-      annotate(
-        "text",
-        x = 47.5,
-        y = 98,
-        hjust = 1,
-        vjust = 1,
-        label = annotation_txt,
-        size = 3.1,
-        lineheight = 0.95,
-        family = font_family
-      )
-  }
-
-  rs <- summary(fit, times = risk_days, extend = TRUE)
-
-  risk_tbl <- data.table(
-    months = risk_months,
-    n_risk = rs$n.risk
-  )
-
-  risk_plot <- ggplot(risk_tbl, aes(x = months)) +
-    geom_text(aes(y = 1, label = months), size = 3.0, family = font_family) +
-    geom_text(aes(y = 0, label = format(n_risk, big.mark = ",")), size = 3.0, family = font_family) +
-    annotate("text", x = -3.0, y = 1, label = "Months from CGP", hjust = 0, size = 3.0, family = font_family) +
-    annotate("text", x = -3.0, y = 0, label = "No. at risk", hjust = 0, size = 3.0, family = font_family) +
+    annotate(
+      "text",
+      x = 0,
+      y = 0.88,
+      label = "Number at risk",
+      hjust = 0.5,
+      vjust = 1,
+      size = 3.1,
+      family = font_family
+    ) +
     scale_x_continuous(
-      limits = c(-6, x_max_months),
-      breaks = risk_months,
+      limits = c(0, x_max_months),
       expand = c(0, 0)
     ) +
-    scale_y_continuous(limits = c(-0.4, 1.4)) +
-    theme_void(base_family = font_family) +
-    theme(plot.margin = margin(0, 10, 0, 5))
-
+    scale_y_continuous(
+      limits = c(0, 1),
+      expand = c(0, 0)
+    ) +
+    coord_cartesian(expand = FALSE, clip = "off") +
+    labs(x = NULL) +
+    annotate(
+      "text",
+      x = x_max_months / 2,
+      y = 0.18,
+      label = "Months from CGP",
+      size = 3.9,
+      family = font_family
+    ) +
+    theme_classic(base_size = 11, base_family = font_family) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.y = element_blank(),
+      axis.title.y = element_blank(),
+      axis.title.x = element_blank(),
+      plot.margin = margin(-14, plot_margin_lr["right"], 12, plot_margin_lr["left"])
+    )
+  
+  aligned <- align_plots(p_main, p_risk, align = "v", axis = "lr")
   plot_grid(
-    p_main,
-    risk_plot,
+    aligned[[1]],
+    aligned[[2]],
     ncol = 1,
-    rel_heights = c(1, 0.16),
-    align = "v"
+    rel_heights = c(1, 0.18)
   )
 }
 
@@ -255,7 +264,14 @@ setDT(patient_case)
 report_all <- readRDS("output/report_all.rds")
 setDT(report_all)
 
-report_cols <- c(id_col, panel_col, cgp_date_col, domestic_approved_n, report_age_col)
+report_cols <- c(
+  id_col,
+  panel_col,
+  cgp_date_col,
+  domestic_approved_n,
+  report_age_col
+)
+
 report_cols <- report_cols[report_cols %in% names(report_all)]
 report_all <- report_all[, ..report_cols]
 
@@ -273,7 +289,11 @@ panels <- report_all[, .(
 
 actionable <- report_all[
   ,
-  .(max_domestic_approved = suppressWarnings(max(as.numeric(get(domestic_approved_n)), na.rm = TRUE))),
+  .(
+    max_domestic_approved = suppressWarnings(
+      max(as.numeric(get(domestic_approved_n)), na.rm = TRUE)
+    )
+  ),
   by = id_col
 ]
 
@@ -314,38 +334,68 @@ message("Events: ", analysis[, sum(opp_event)])
 message("Censored: ", analysis[, .N - sum(opp_event)])
 message("Matched therapy censored: ", analysis[opp_event == 0 & !is.na(tx_after_cgp), .N])
 
-fit_a <- survfit(Surv(opp_time_days, opp_event) ~ 1, data = analysis, conf.int = 0.95)
+# ============================================================
+# Figure 11A only
+# ============================================================
 
-lm_a <- km_landmarks(fit_a)
-
-anno_a <- paste(
-  "Median opportunity: not reached",
-  paste0(lm_a$landmark, ": ", lm_a$rate_ci),
-  sep = "\n"
+fit_a <- survfit(
+  Surv(opp_time_days, opp_event) ~ 1,
+  data = analysis,
+  conf.int = 0.95
 )
 
-p_a <- plot_km_panel_a(fit_a, annotation_txt = anno_a)
+# ----------------------------
+# Output 12, 24, 36, 48, 60-month rates
+# ----------------------------
 
-print(p_a)
+rate_months <- c(12, 24, 36, 48, 60)
+rate_days <- round(rate_months * 365.25 / 12)
+
+rate_summary <- summary(fit_a, times = rate_days, extend = TRUE)
+
+rate_table <- data.table(
+  months = rate_months,
+  days = rate_days,
+  remaining_opportunity_pct = round(rate_summary$surv * 100, 1),
+  lower_95_pct = round(rate_summary$lower * 100, 1),
+  upper_95_pct = round(rate_summary$upper * 100, 1),
+  n_risk = rate_summary$n.risk
+)
+
+print(rate_table)
+
+fwrite(
+  rate_table,
+  file.path(fig_dir, "Figure11A_12_24_36_48_60_month_rates.csv")
+)
+
+# ----------------------------
+# Plot
+# ----------------------------
+
+p_a <- plot_km_panel_a(fit_a, x_max_months = 62)
+
+# RStudio Plots pane（Source 実行時にも表示）
+if (interactive()) {
+  print(p_a)
+}
 
 ggsave(
-  file.path(fig_dir, "Figure11A_OpportunityDecay_Overall_Months.pdf"),
+  file.path(fig_dir, "Figure11A_OpportunityDecay_Overall_Months60.pdf"),
   p_a,
-  width = 7.2,
-  height = 5.8,
+  width = 7.8,
+  height = 5.6,
   device = cairo_pdf
 )
 
 ggsave(
-  file.path(fig_dir, "Figure11A_OpportunityDecay_Overall_Months.png"),
+  file.path(fig_dir, "Figure11A_OpportunityDecay_Overall_Months60.png"),
   p_a,
-  width = 7.2,
-  height = 5.8,
+  width = 7.8,
+  height = 5.6,
   dpi = 300,
   bg = "white"
 )
-
-fwrite(lm_a, file.path(fig_dir, "Figure11A_summary_table_months.csv"))
 
 message("Figure 11A completed.")
 message("Saved to: ", fig_dir)
